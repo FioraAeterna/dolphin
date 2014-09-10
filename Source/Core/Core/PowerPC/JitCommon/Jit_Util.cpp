@@ -390,34 +390,55 @@ void EmuCodeBlock::SafeLoadToReg(X64Reg reg_value, const Gen::OpArg & opAddress,
 	}
 }
 
-u8 *EmuCodeBlock::UnsafeWriteRegToReg(X64Reg reg_value, X64Reg reg_addr, int accessSize, s32 offset, bool swap)
+u8 *EmuCodeBlock::UnsafeWriteRegToReg(OpArg reg_value, X64Reg reg_addr, int accessSize, s32 offset, bool swap)
 {
 	u8* result = GetWritableCodePtr();
 	OpArg dest = MComplex(RMEM, reg_addr, SCALE_1, offset);
-	if (swap)
+	if (reg_value.IsImm())
+	{
+		if (swap)
+		{
+			if (accessSize == 32)
+				reg_value = Imm32(Common::swap32((u32)reg_value.offset));
+			else if (accessSize == 16)
+				reg_value = Imm16(Common::swap16((u16)reg_value.offset));
+			else
+				reg_value = Imm8((u8)reg_value.offset);
+		}
+		MOV(accessSize, dest, reg_value);
+	}
+	else if (swap)
 	{
 		if (cpu_info.bMOVBE)
 		{
-			MOVBE(accessSize, dest, R(reg_value));
+			MOVBE(accessSize, dest, reg_value);
 		}
 		else
 		{
 			if (accessSize > 8)
-				BSWAP(accessSize, reg_value);
+				BSWAP(accessSize, reg_value.GetSimpleReg());
 			result = GetWritableCodePtr();
-			MOV(accessSize, dest, R(reg_value));
+			MOV(accessSize, dest, reg_value);
 		}
 	}
 	else
 	{
-		MOV(accessSize, dest, R(reg_value));
+		MOV(accessSize, dest, reg_value);
 	}
 
 	return result;
 }
 
-void EmuCodeBlock::SafeWriteRegToReg(X64Reg reg_value, X64Reg reg_addr, int accessSize, s32 offset, u32 registersInUse, int flags)
+void EmuCodeBlock::SafeWriteRegToReg(OpArg reg_value, X64Reg reg_addr, int accessSize, s32 offset, u32 registersInUse, int flags)
 {
+	// set the correct immediate format
+	if (reg_value.IsImm())
+	{
+		reg_value = accessSize == 32 ? Imm32((u32)reg_value.offset) :
+		            accessSize == 16 ? Imm16((u16)reg_value.offset) :
+		                               Imm8((u8)reg_value.offset);
+	}
+
 	if (!SConfig::GetInstance().m_LocalCoreStartupParameter.bMMU &&
 	    SConfig::GetInstance().m_LocalCoreStartupParameter.bFastmem &&
 	    !(flags & (SAFE_LOADSTORE_NO_SWAP | SAFE_LOADSTORE_NO_FASTMEM))
@@ -466,6 +487,17 @@ void EmuCodeBlock::SafeWriteRegToReg(X64Reg reg_value, X64Reg reg_addr, int acce
 	}
 #endif
 
+	X64Reg reg;
+	if (reg_value.IsImm())
+	{
+		MOV(accessSize, R(RSCRATCH2), reg_value);
+		reg = RSCRATCH2;
+	}
+	else
+	{
+		reg = reg_value.GetSimpleReg();
+	}
+
 	TEST(32, R(reg_addr), Imm32(mem_mask));
 	FixupBranch fast = J_CC(CC_Z, true);
 	// PC is used by memory watchpoints (if enabled) or to print accurate PC locations in debug logs
@@ -476,16 +508,16 @@ void EmuCodeBlock::SafeWriteRegToReg(X64Reg reg_value, X64Reg reg_addr, int acce
 	switch (accessSize)
 	{
 	case 64:
-		ABI_CallFunctionRR(swap ? ((void *)&Memory::Write_U64) : ((void *)&Memory::Write_U64_Swap), reg_value, reg_addr);
+		ABI_CallFunctionRR(swap ? ((void *)&Memory::Write_U64) : ((void *)&Memory::Write_U64_Swap), reg, reg_addr);
 		break;
 	case 32:
-		ABI_CallFunctionRR(swap ? ((void *)&Memory::Write_U32) : ((void *)&Memory::Write_U32_Swap), reg_value, reg_addr);
+		ABI_CallFunctionRR(swap ? ((void *)&Memory::Write_U32) : ((void *)&Memory::Write_U32_Swap), reg, reg_addr);
 		break;
 	case 16:
-		ABI_CallFunctionRR(swap ? ((void *)&Memory::Write_U16) : ((void *)&Memory::Write_U16_Swap), reg_value, reg_addr);
+		ABI_CallFunctionRR(swap ? ((void *)&Memory::Write_U16) : ((void *)&Memory::Write_U16_Swap), reg, reg_addr);
 		break;
 	case 8:
-		ABI_CallFunctionRR((void *)&Memory::Write_U8, reg_value, reg_addr);
+		ABI_CallFunctionRR((void *)&Memory::Write_U8, reg, reg_addr);
 		break;
 	}
 	ABI_PopRegistersAndAdjustStack(registersInUse, rsp_alignment);
