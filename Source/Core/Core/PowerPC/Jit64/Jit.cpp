@@ -192,7 +192,7 @@ void Jit64::Init()
 		}
 		else
 		{
-			jo.enableBlocklink = !SConfig::GetInstance().m_LocalCoreStartupParameter.bMMU;
+			jo.enableBlocklink = false;// !SConfig::GetInstance().m_LocalCoreStartupParameter.bMMU;
 		}
 	}
 	jo.fpAccurateFcmp = SConfig::GetInstance().m_LocalCoreStartupParameter.bEnableFPRF;

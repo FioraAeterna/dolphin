@@ -133,8 +133,15 @@ void Jit64AsmRoutineManager::Generate()
 			if (SConfig::GetInstance().m_LocalCoreStartupParameter.bWii && (SConfig::GetInstance().m_LocalCoreStartupParameter.bMMU || SConfig::GetInstance().m_LocalCoreStartupParameter.bTLBHack))
 				SetJumpTarget(exit_vmem);
 
+			PUSH(RSCRATCH);
+			ABI_PushRegistersAndAdjustStack(0, 0);
+			ABI_CallFunctionR(reinterpret_cast<void *>(&EmuCodeBlock::HandleInstructionCache), RSCRATCH);
+			ABI_PopRegistersAndAdjustStack(0, 0);
+			POP(RSCRATCH);
+
 			TEST(32, R(RSCRATCH), R(RSCRATCH));
 			FixupBranch notfound = J_CC(CC_L);
+
 				//grab from list and jump to it
 				JMPptr(MComplex(RCODE_POINTERS, RSCRATCH, 8, 0));
 			SetJumpTarget(notfound);

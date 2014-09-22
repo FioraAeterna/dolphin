@@ -10,6 +10,7 @@
 #include "Core/HW/MMIO.h"
 #include "Core/PowerPC/JitCommon/Jit_Util.h"
 #include "Core/PowerPC/JitCommon/JitBase.h"
+#include "Core/PowerPC/JitInterface.h"
 
 using namespace Gen;
 
@@ -922,4 +923,36 @@ void EmuCodeBlock::JitClearCAOV(bool ca, bool oe)
 	if (mask == 0xFFFFFFFF)
 		return;
 	AND(32, PPCSTATE(spr[SPR_XER]), Imm32(mask));
+}
+
+bool EmuCodeBlock::HandleInstructionCache(u32 address)
+{
+	u32 len = 32; // fixme
+	static u32 icache_tags[1024];
+	const int associativity = 8;
+	u32 start_block = address >> 5;
+	u32 end_block = (address + len) >> 5;
+	bool lookup_success = true;
+
+	for (u32 i = start_block; i <= end_block; i++)
+	{
+		u32 tag = i >> 7;
+		u32 index = i & 0x7F;
+		bool found = false;
+		for (int j = 0; j < 8; j++)
+			if (icache_tags[index + j * 128] == tag)
+			{
+				found = true;
+				break;
+			}
+		if (!found)
+		{
+			lookup_success = false;
+			int newset = rand() & 7; // random LRU??? I have no idea what the CPU does
+			icache_tags[index + newset * 128] = tag;
+			JitInterface::InvalidateICache(start_block << 5, 32);
+		}
+	}
+
+	return lookup_success;
 }
