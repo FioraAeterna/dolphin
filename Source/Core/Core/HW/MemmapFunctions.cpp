@@ -91,9 +91,14 @@ static u32 EFB_Read(const u32 addr)
 
 static void GenerateDSIException(u32 _EffectiveAddress, bool _bWrite);
 
-template <typename T, typename U>
-__forceinline void ReadFromHardware(U &_var, const u32 em_address, Memory::XCheckTLBFlag flag)
+template <XCheckTLBFlag flag, typename T, typename U>
+__forceinline void ReadFromHardware(U &_var, const u32 em_address)
 {
+	int segment = em_address >> 28;
+	// Quick check for an address that can't meet any of the following conditions,
+	// to speed up the MMU path.
+	if (0xCFC & (1 << segment))
+		goto translateaddress;
 	// TODO: Figure out the fastest order of tests for both read and write (they are probably different).
 	if ((em_address & 0xC8000000) == 0xC8000000)
 	{
@@ -102,30 +107,28 @@ __forceinline void ReadFromHardware(U &_var, const u32 em_address, Memory::XChec
 		else
 			_var = (T)mmio_mapping->Read<typename std::make_unsigned<T>::type>(em_address);
 	}
-	else if (((em_address & 0xF0000000) == 0x80000000) ||
-		((em_address & 0xF0000000) == 0xC0000000) ||
-		((em_address & 0xF0000000) == 0x00000000))
+	else if (segment == 0x8 || segment == 0xC || segment == 0x0)
 	{
 		_var = bswap((*(const T*)&m_pRAM[em_address & RAM_MASK]));
 	}
-	else if (m_pEXRAM && (((em_address & 0xF0000000) == 0x90000000) ||
-		((em_address & 0xF0000000) == 0xD0000000) ||
-		((em_address & 0xF0000000) == 0x10000000)))
+	else if (m_pEXRAM && (segment == 0x9 || segment == 0xD || segment == 0x1))
 	{
 		_var = bswap((*(const T*)&m_pEXRAM[em_address & EXRAM_MASK]));
 	}
-	else if ((em_address >= 0xE0000000) && (em_address < (0xE0000000+L1_CACHE_SIZE)))
+	else if (segment == 0xE && (em_address < (0xE0000000+L1_CACHE_SIZE)))
 	{
 		_var = bswap((*(const T*)&m_pL1Cache[em_address & L1_CACHE_MASK]));
 	}
-	else if ((bFakeVMEM && ((em_address &0xF0000000) == 0x70000000)) ||
-		(bFakeVMEM && ((em_address &0xF0000000) == 0x40000000)))
-	{
-		// fake VMEM
-		_var = bswap((*(const T*)&m_pFakeVMEM[em_address & FAKEVMEM_MASK]));
-	}
 	else
 	{
+translateaddress:
+		if (bFakeVMEM && (segment == 0x7 || segment == 0x4))
+		{
+			// fake VMEM
+			_var = bswap((*(const T*)&m_pFakeVMEM[em_address & FAKEVMEM_MASK]));
+			return;
+		}
+	
 		// MMU
 		// Handle loads that cross page boundaries (ewwww)
 		if (sizeof(T) > 1 && (em_address & (HW_PAGE_SIZE - 1)) > HW_PAGE_SIZE - sizeof(T))
@@ -135,12 +138,12 @@ __forceinline void ReadFromHardware(U &_var, const u32 em_address, Memory::XChec
 			// way isn't too terrible.
 			// TODO: floats on non-word-aligned boundaries should technically cause alignment exceptions.
 			// Note that "word" means 32-bit, so paired singles or doubles might still be 32-bit aligned!
-			u32 tlb_addr = TranslateAddress(em_address, flag);
+			u32 tlb_addr = TranslateAddress<flag>(em_address);
 			for (u32 addr = em_address; addr < em_address + sizeof(T); addr++, tlb_addr++)
 			{
 				// Start of the new page... translate the address again!
-				if (!(addr & (HW_PAGE_SIZE-1)))
-					tlb_addr = TranslateAddress(addr, flag);
+				if (!(addr & (HW_PAGE_SIZE - 1)))
+					tlb_addr = TranslateAddress<flag>(addr);
 				// Important: we need to generate the DSI on the first store that caused the fault, NOT
 				// the address of the start of the load.
 				if (tlb_addr == 0)
@@ -171,7 +174,7 @@ __forceinline void ReadFromHardware(U &_var, const u32 em_address, Memory::XChec
 		}
 		else
 		{
-			u32 tlb_addr = TranslateAddress(em_address, flag);
+			u32 tlb_addr = TranslateAddress<flag>(em_address);
 			if (tlb_addr == 0)
 			{
 				if (flag == FLAG_READ)
@@ -198,9 +201,14 @@ __forceinline void ReadFromHardware(U &_var, const u32 em_address, Memory::XChec
 }
 
 
-template <typename T>
-__forceinline void WriteToHardware(u32 em_address, const T data, Memory::XCheckTLBFlag flag)
+template <XCheckTLBFlag flag, typename T>
+__forceinline void WriteToHardware(u32 em_address, const T data)
 {
+	int segment = em_address >> 28;
+	// Quick check for an address that can't meet any of the following conditions,
+	// to speed up the MMU path.
+	if (0xCFC & (1 << segment))
+		goto translateaddress;
 	// First, let's check for FIFO writes, since they are probably the most common
 	// reason we end up in this function:
 	if ((em_address & 0xFFFFF000) == 0xCC008000)
@@ -239,43 +247,41 @@ __forceinline void WriteToHardware(u32 em_address, const T data, Memory::XCheckT
 			return;
 		}
 	}
-	else if (((em_address & 0xF0000000) == 0x80000000) ||
-		((em_address & 0xF0000000) == 0xC0000000) ||
-		((em_address & 0xF0000000) == 0x00000000))
+	else if (segment == 0x8 || segment == 0xC || segment == 0x0)
 	{
 		*(T*)&m_pRAM[em_address & RAM_MASK] = bswap(data);
 		return;
 	}
-	else if (m_pEXRAM && (((em_address & 0xF0000000) == 0x90000000) ||
-		((em_address & 0xF0000000) == 0xD0000000) ||
-		((em_address & 0xF0000000) == 0x10000000)))
+	else if (m_pEXRAM && (segment == 0x9 || segment == 0xD || segment == 0x1))
 	{
 		*(T*)&m_pEXRAM[em_address & EXRAM_MASK] = bswap(data);
 		return;
 	}
-	else if ((em_address >= 0xE0000000) && (em_address < (0xE0000000+L1_CACHE_SIZE)))
+	else if (segment == 0xE && (em_address < (0xE0000000+L1_CACHE_SIZE)))
 	{
 		*(T*)&m_pL1Cache[em_address & L1_CACHE_MASK] = bswap(data);
 		return;
 	}
-	else if ((bFakeVMEM && ((em_address &0xF0000000) == 0x70000000)) ||
-		(bFakeVMEM && ((em_address &0xF0000000) == 0x40000000)))
+	else 
 	{
-		// fake VMEM
-		*(T*)&m_pFakeVMEM[em_address & FAKEVMEM_MASK] = bswap(data);
-	}
-	else
-	{
+translateaddress:
+		if (bFakeVMEM && (segment == 0x7 || segment == 0x4))
+		{
+			// fake VMEM
+			*(T*)&m_pFakeVMEM[em_address & FAKEVMEM_MASK] = bswap(data);
+			return;
+		}
+
 		// MMU
 		// Handle stores that cross page boundaries (ewwww)
-		if (sizeof(T) > 1 && (em_address & (HW_PAGE_SIZE-1)) > HW_PAGE_SIZE - sizeof(T))
+		if (sizeof(T) > 1 && (em_address & (HW_PAGE_SIZE - 1)) > HW_PAGE_SIZE - sizeof(T))
 		{
 			T val = bswap(data);
-			u32 tlb_addr = TranslateAddress(em_address, flag);
+			u32 tlb_addr = TranslateAddress<flag>(em_address);
 			for (u32 addr = em_address; addr < em_address + sizeof(T); addr++, tlb_addr++)
 			{
-				if (!(addr & (HW_PAGE_SIZE-1)))
-					tlb_addr = TranslateAddress(addr, flag);
+				if (!(addr & (HW_PAGE_SIZE - 1)))
+					tlb_addr = TranslateAddress<flag>(addr);
 				if (tlb_addr == 0)
 				{
 					if (flag == FLAG_WRITE)
@@ -304,7 +310,7 @@ __forceinline void WriteToHardware(u32 em_address, const T data, Memory::XCheckT
 		}
 		else
 		{
-			u32 tlb_addr = TranslateAddress(em_address, flag);
+			u32 tlb_addr = TranslateAddress<flag>(em_address);
 			if (tlb_addr == 0)
 			{
 				if (flag == FLAG_WRITE)
@@ -352,7 +358,7 @@ u32 Read_Opcode(u32 _Address)
 		(_Address & ADDR_MASK_MEM1))
 	{
 		// TODO: Check for MSR instruction address translation flag before translating
-		u32 tlb_addr = Memory::TranslateAddress(_Address, FLAG_OPCODE);
+		u32 tlb_addr = TranslateAddress<FLAG_OPCODE>(_Address);
 		if (tlb_addr == 0)
 		{
 			GenerateISIException(_Address);
@@ -367,63 +373,49 @@ u32 Read_Opcode(u32 _Address)
 	return PowerPC::ppcState.iCache.ReadInstruction(_Address);
 }
 
+#ifdef ENABLE_MEM_CHECK
+#define MEMCHECK(write, size)\
+{\
+TMemCheck *mc = PowerPC::memchecks.GetMemCheck(_Address);\
+if (mc)\
+{\
+	mc->numHits++;\
+	mc->Action(&PowerPC::debug_interface, (u32)_var, _Address, write, size, PC);\
+}\
+}
+#else
+#define MEMCHECK(write, size)
+#endif
+
 u8 Read_U8(const u32 _Address)
 {
 	u8 _var = 0;
-	ReadFromHardware<u8>(_var, _Address, FLAG_READ);
-#ifdef ENABLE_MEM_CHECK
-	TMemCheck *mc = PowerPC::memchecks.GetMemCheck(_Address);
-	if (mc)
-	{
-		mc->numHits++;
-		mc->Action(&PowerPC::debug_interface, _var, _Address, false, 1, PC);
-	}
-#endif
+	ReadFromHardware<FLAG_READ, u8>(_var, _Address);
+	MEMCHECK(false, 1);
 	return (u8)_var;
 }
 
 u16 Read_U16(const u32 _Address)
 {
 	u16 _var = 0;
-	ReadFromHardware<u16>(_var, _Address, FLAG_READ);
-#ifdef ENABLE_MEM_CHECK
-	TMemCheck *mc = PowerPC::memchecks.GetMemCheck(_Address);
-	if (mc)
-	{
-		mc->numHits++;
-		mc->Action(&PowerPC::debug_interface, _var, _Address, false, 2, PC);
-	}
-#endif
+	ReadFromHardware<FLAG_READ, u16>(_var, _Address);
+	MEMCHECK(false, 2);
 	return (u16)_var;
 }
 
 u32 Read_U32(const u32 _Address)
 {
 	u32 _var = 0;
-	ReadFromHardware<u32>(_var, _Address, FLAG_READ);
-#ifdef ENABLE_MEM_CHECK
-	TMemCheck *mc = PowerPC::memchecks.GetMemCheck(_Address);
-	if (mc)
-	{
-		mc->numHits++;
-		mc->Action(&PowerPC::debug_interface, _var, _Address, false, 4, PC);
-	}
-#endif
+	ReadFromHardware<FLAG_READ, u32>(_var, _Address);
+	MEMCHECK(false, 4);
 	return _var;
 }
 
 u64 Read_U64(const u32 _Address)
 {
 	u64 _var = 0;
-	ReadFromHardware<u64>(_var, _Address, FLAG_READ);
-#ifdef ENABLE_MEM_CHECK
-	TMemCheck *mc = PowerPC::memchecks.GetMemCheck(_Address);
-	if (mc)
-	{
-		mc->numHits++;
-		mc->Action(&PowerPC::debug_interface, (u32)_var, _Address, false, 8, PC);
-	}
-#endif
+	ReadFromHardware<FLAG_READ, u64>(_var, _Address);
+	MEMCHECK(false, 8);
 	return _var;
 }
 
@@ -451,40 +443,46 @@ float Read_F32(const u32 _Address)
 	return cvt.d;
 }
 
-u32 Read_U8_Val(u32 address, u32 val)
+u32 Read_U8_Val(const u32 _Address, u32 _var)
 {
-	ReadFromHardware<u8>(val, address, FLAG_READ);
-	return val;
+	ReadFromHardware<FLAG_READ, u8>(_var, _Address);
+	MEMCHECK(false, 1);
+	return _var;
 }
 
-u32 Read_S8_Val(u32 address, u32 val)
+u32 Read_S8_Val(const u32 _Address, u32 _var)
 {
-	ReadFromHardware<s8>(val, address, FLAG_READ);
-	return val;
+	ReadFromHardware<FLAG_READ, s8>(_var, _Address);
+	MEMCHECK(false, 1);
+	return _var;
 }
 
-u32 Read_U16_Val(u32 address, u32 val)
+u32 Read_U16_Val(const u32 _Address, u32 _var)
 {
-	ReadFromHardware<u16>(val, address, FLAG_READ);
-	return val;
+	ReadFromHardware<FLAG_READ, u16>(_var, _Address);
+	MEMCHECK(false, 2);
+	return _var;
 }
 
-u32 Read_S16_Val(u32 address, u32 val)
+u32 Read_S16_Val(const u32 _Address, u32 _var)
 {
-	ReadFromHardware<s16>(val, address, FLAG_READ);
-	return val;
+	ReadFromHardware<FLAG_READ, s16>(_var, _Address);
+	MEMCHECK(false, 2);
+	return _var;
 }
 
-u32 Read_U32_Val(u32 address, u32 val)
+u32 Read_U32_Val(const u32 _Address, u32 _var)
 {
-	ReadFromHardware<u32>(val, address, FLAG_READ);
-	return val;
+	ReadFromHardware<FLAG_READ, u32>(_var, _Address);
+	MEMCHECK(false, 4);
+	return _var;
 }
 
-u64 Read_U64_Val(u32 address, u64 val)
+u64 Read_U64_Val(const u32 _Address, u64 _var)
 {
-	ReadFromHardware<u64>(val, address, FLAG_READ);
-	return val;
+	ReadFromHardware<FLAG_READ, u64>(_var, _Address);
+	MEMCHECK(false, 8);
+	return _var;
 }
 
 u32 Read_U8_ZX(const u32 _Address)
@@ -497,88 +495,60 @@ u32 Read_U16_ZX(const u32 _Address)
 	return (u32)Read_U16(_Address);
 }
 
-void Write_U8(const u8 _Data, const u32 _Address)
+void Write_U8(const u8 _var, const u32 _Address)
 {
-#ifdef ENABLE_MEM_CHECK
-	TMemCheck *mc = PowerPC::memchecks.GetMemCheck(_Address);
-	if (mc)
-	{
-		mc->numHits++;
-		mc->Action(&PowerPC::debug_interface, _Data,_Address,true,1,PC);
-	}
-#endif
-	WriteToHardware<u8>(_Address, _Data, FLAG_WRITE);
+	MEMCHECK(true, 1);
+	WriteToHardware<FLAG_WRITE, u8>(_Address, _var);
+}
+
+void Write_U16(const u16 _var, const u32 _Address)
+{
+	MEMCHECK(true, 2);
+	WriteToHardware<FLAG_WRITE, u16>(_Address, _var);
+}
+void Write_U16_Swap(const u16 _var, const u32 _Address)
+{
+	MEMCHECK(true, 2);
+	Write_U16(Common::swap16(_var), _Address);
 }
 
 
-void Write_U16(const u16 _Data, const u32 _Address)
+void Write_U32(const u32 _var, const u32 _Address)
 {
-#ifdef ENABLE_MEM_CHECK
-	TMemCheck *mc = PowerPC::memchecks.GetMemCheck(_Address);
-	if (mc)
-	{
-		mc->numHits++;
-		mc->Action(&PowerPC::debug_interface, _Data,_Address,true,2,PC);
-	}
-#endif
-
-	WriteToHardware<u16>(_Address, _Data, FLAG_WRITE);
+	MEMCHECK(true, 4);
+	WriteToHardware<FLAG_WRITE, u32>(_Address, _var);
 }
-void Write_U16_Swap(const u16 _Data, const u32 _Address)
+void Write_U32_Swap(const u32 _var, const u32 _Address)
 {
-	Write_U16(Common::swap16(_Data), _Address);
+	MEMCHECK(true, 4);
+	Write_U32(Common::swap32(_var), _Address);
 }
 
-
-void Write_U32(const u32 _Data, const u32 _Address)
+void Write_U64(const u64 _var, const u32 _Address)
 {
-#ifdef ENABLE_MEM_CHECK
-	TMemCheck *mc = PowerPC::memchecks.GetMemCheck(_Address);
-	if (mc)
-	{
-		mc->numHits++;
-		mc->Action(&PowerPC::debug_interface, _Data,_Address,true,4,PC);
-	}
-#endif
-	WriteToHardware<u32>(_Address, _Data, FLAG_WRITE);
+	MEMCHECK(true, 8);
+	WriteToHardware<FLAG_WRITE, u64>(_Address, _var);
 }
-void Write_U32_Swap(const u32 _Data, const u32 _Address)
+void Write_U64_Swap(const u64 _var, const u32 _Address)
 {
-	Write_U32(Common::swap32(_Data), _Address);
+	MEMCHECK(true, 8);
+	Write_U64(Common::swap64(_var), _Address);
 }
 
-void Write_U64(const u64 _Data, const u32 _Address)
-{
-#ifdef ENABLE_MEM_CHECK
-	TMemCheck *mc = PowerPC::memchecks.GetMemCheck(_Address);
-	if (mc)
-	{
-		mc->numHits++;
-		mc->Action(&PowerPC::debug_interface, (u32)_Data,_Address,true,8,PC);
-	}
-#endif
-
-	WriteToHardware<u64>(_Address, _Data, FLAG_WRITE);
-}
-void Write_U64_Swap(const u64 _Data, const u32 _Address)
-{
-	Write_U64(Common::swap64(_Data), _Address);
-}
-
-void Write_F64(const double _Data, const u32 _Address)
+void Write_F64(const double _var, const u32 _Address)
 {
 	union
 	{
 		u64 i;
 		double d;
 	} cvt;
-	cvt.d = _Data;
+	cvt.d = _var;
 	Write_U64(cvt.i, _Address);
 }
 u8 ReadUnchecked_U8(const u32 _Address)
 {
 	u8 _var = 0;
-	ReadFromHardware<u8>(_var, _Address, FLAG_NO_EXCEPTION);
+	ReadFromHardware<FLAG_NO_EXCEPTION, u8>(_var, _Address);
 	return _var;
 }
 
@@ -586,19 +556,19 @@ u8 ReadUnchecked_U8(const u32 _Address)
 u32 ReadUnchecked_U32(const u32 _Address)
 {
 	u32 _var = 0;
-	ReadFromHardware<u32>(_var, _Address, FLAG_NO_EXCEPTION);
+	ReadFromHardware<FLAG_NO_EXCEPTION, u32>(_var, _Address);
 	return _var;
 }
 
 void WriteUnchecked_U8(const u8 _iValue, const u32 _Address)
 {
-	WriteToHardware<u8>(_Address, _iValue, FLAG_NO_EXCEPTION);
+	WriteToHardware<FLAG_NO_EXCEPTION, u8>(_Address, _iValue);
 }
 
 
 void WriteUnchecked_U32(const u32 _iValue, const u32 _Address)
 {
-	WriteToHardware<u32>(_Address, _iValue, FLAG_NO_EXCEPTION);
+	WriteToHardware<FLAG_NO_EXCEPTION, u32>(_Address, _iValue);
 }
 
 // *********************************************************************************
@@ -744,8 +714,9 @@ void SDRUpdated()
 
 static __forceinline u32 LookupTLBPageAddress(const XCheckTLBFlag _Flag, const u32 vpa, u32 *paddr)
 {
-	PowerPC::tlb_entry *tlbe = PowerPC::ppcState.tlb[_Flag == FLAG_OPCODE][(vpa >> HW_PAGE_INDEX_SHIFT) & HW_PAGE_INDEX_MASK];
-	if (tlbe[0].tag == (vpa & ~0xfff) && !(tlbe[0].flags & TLB_FLAG_INVALID))
+	int tag = vpa >> HW_PAGE_INDEX_SHIFT;
+	PowerPC::tlb_entry *tlbe = PowerPC::ppcState.tlb[_Flag == FLAG_OPCODE][tag & HW_PAGE_INDEX_MASK];
+	if (tlbe[0].tag == tag && !(tlbe[0].flags & TLB_FLAG_INVALID))
 	{
 		// Check if C bit requires updating
 		if (_Flag == FLAG_WRITE)
@@ -770,7 +741,7 @@ static __forceinline u32 LookupTLBPageAddress(const XCheckTLBFlag _Flag, const u
 
 		return 1;
 	}
-	if (tlbe[1].tag == (vpa & ~0xfff) && !(tlbe[1].flags & TLB_FLAG_INVALID))
+	if (tlbe[1].tag == tag && !(tlbe[1].flags & TLB_FLAG_INVALID))
 	{
 		// Check if C bit requires updating
 		if (_Flag == FLAG_WRITE)
@@ -810,7 +781,7 @@ static __forceinline void UpdateTLBEntry(const XCheckTLBFlag _Flag, UPTE2 PTE2, 
 		tlbe[1].flags &= ~TLB_FLAG_MOST_RECENT;
 		tlbe[0].paddr = PTE2.RPN << HW_PAGE_INDEX_SHIFT;
 		tlbe[0].pte = PTE2.Hex;
-		tlbe[0].tag = vpa & ~0xfff;
+		tlbe[0].tag = vpa >> HW_PAGE_INDEX_SHIFT;
 	}
 	else
 	{
@@ -818,7 +789,7 @@ static __forceinline void UpdateTLBEntry(const XCheckTLBFlag _Flag, UPTE2 PTE2, 
 		tlbe[0].flags &= ~TLB_FLAG_MOST_RECENT;
 		tlbe[1].paddr = PTE2.RPN << HW_PAGE_INDEX_SHIFT;
 		tlbe[1].pte = PTE2.Hex;
-		tlbe[1].tag = vpa & ~0xfff;
+		tlbe[1].tag = vpa >> HW_PAGE_INDEX_SHIFT;
 	}
 }
 
@@ -965,7 +936,8 @@ static u32 TranslateBlockAddress(const u32 addr, const XCheckTLBFlag _Flag)
 }
 
 // Translate effective address using BAT or PAT.  Returns 0 if the address cannot be translated.
-u32 TranslateAddress(const u32 _Address, const XCheckTLBFlag _Flag)
+template <const XCheckTLBFlag _Flag>
+u32 TranslateAddress(const u32 _Address)
 {
 	// Check MSR[IR] bit before translating instruction addresses.  Rogue Leader clears IR and DR??
 	//if ((_Flag == FLAG_OPCODE) && !(MSR & (1 << (31 - 26)))) return _Address;
